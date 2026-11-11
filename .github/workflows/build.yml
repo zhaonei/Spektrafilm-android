@@ -64,14 +64,22 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      # The only logic this fork touches. Fast, and it gates the APK so a bad
-      # preview table can never be published.
-      - name: Preview sizing unit tests
+      # The two things this fork actually changes. Fast, and they gate the APK so a
+      # broken preview table or a broken TIFF writer can never be published.
+      - name: Native TIFF writer tests (host g++)
+        run: |
+          set -euo pipefail
+          cd lib/tiffwriter/src/main/cpp
+          g++ -std=c++17 -O2 -I. tests/test_tiff_writer.cpp tiff_writer.cpp -o "$RUNNER_TEMP/test_tiff_writer"
+          "$RUNNER_TEMP/test_tiff_writer"
+
+      - name: Preview sizing + memory classification unit tests
         run: |
           set -euo pipefail
           chmod +x ./gradlew
           ./gradlew :app:testDebugUnitTest \
             --tests "com.spectrafilm.app.AdaptivePreviewTest" \
+            --tests "com.spectrafilm.app.MemoryReclaimRetryTest" \
             --stacktrace
 
       - name: Assemble unsigned release
@@ -98,7 +106,7 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" \
             | grep -E "^package:|^sdkVersion|^targetSdkVersion|^application-label:"
 
-      - name: Align, sign v1+v2+v3, verify
+      - name: Align, sign (v1 JAR + v2), verify
         env:
           SIGNING_KEYSTORE: ${{ secrets.SIGNING_KEYSTORE }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}

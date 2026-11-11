@@ -444,6 +444,59 @@ bool blockUntilConcurrentCancel(void* opaque) noexcept {
     return state->cancelled.load(std::memory_order_acquire);
 }
 
+// The file writers stream the image in bounded row blocks instead of building the
+// whole strip first (that allocation is what failed on a 12 GB phone at 40+ MP).
+// This case is large enough to cross a block boundary, so it fails if a block seam
+// ever drops, duplicates or misorders a row -- the W x H of the older cases fit in
+// one block and could not catch that.
+void runStreamedBlockCase() {
+    std::printf("[streamed-blocks]\n");
+    const int W = 1200, H = 700;  // strip = 5,040,000 bytes > one 4 MiB block
+    std::vector<uint16_t> pixels(static_cast<size_t>(W) * H * 3);
+    for (size_t i = 0; i < pixels.size(); ++i)
+        pixels[i] = static_cast<uint16_t>((i * 2654435761u) >> 16);
+
+    TiffMetadata meta;
+    meta.software = "Spektrafilm-test";
+    meta.dateTime = "2026:05:29 12:00:00";
+    meta.exifColorSpace = 0xFFFF;
+
+    const std::string path = "/tmp/sf_tiff_stream_blocks.tiff";
+    const TiffWriteResult written =
+        writeTiff16ToFile(pixels.data(), W, H, meta, TiffCompression::None, path);
+    CHECK(written.ok, "streamed write returns ok");
+    if (!written.ok) { std::printf("  error: %s\n", written.error.c_str()); return; }
+
+    std::vector<uint8_t> file;
+    CHECK(readFile(path, file), "streamed file is readable");
+    CHECK(written.bytesWritten == file.size(), "reported byte count matches the file");
+
+    // Same pixels through the buffered in-memory writer: the container must not
+    // depend on how the samples reached the file.
+    std::vector<uint8_t> buffered;
+    const TiffWriteResult inMemory =
+        writeTiff16ToMemory(pixels.data(), W, H, meta, TiffCompression::None, buffered);
+    CHECK(inMemory.ok, "buffered write returns ok");
+    CHECK(file == buffered, "streamed file is byte-identical to the buffered one");
+
+    std::map<uint16_t, IfdEntry> ifd;
+    parseIfd(file, rdU32(file, 4), ifd);
+    CHECK(ifd.count(273) == 1 && readScalar(file, ifd[273]) != 0, "StripOffsets present");
+    CHECK(ifd.count(279) == 1 &&
+              readScalar(file, ifd[279]) == static_cast<uint32_t>(W) * H * 6,
+          "StripByteCounts covers every row");
+    CHECK(ifd.count(278) == 1 && readScalar(file, ifd[278]) == static_cast<uint32_t>(H),
+          "RowsPerStrip still spans the whole image");
+
+    // Full sample round-trip through the independent reader, block seams included.
+    std::vector<uint16_t> decoded;
+    decodeStrip(file, 1, readScalar(file, ifd[273]), readScalar(file, ifd[279]),
+                static_cast<uint64_t>(W) * H * 3, decoded);
+    CHECK(decoded == pixels, "every sample round-trips across the block boundary");
+
+    std::remove(path.c_str());
+}
+
 void runSafetyCases() {
     std::printf("[safety]\n");
     const uint16_t onePixel[3] = {1, 2, 3};
@@ -601,6 +654,8 @@ int main() {
 
     runFloatCase("uncompressed", TiffCompression::None);
     runFloatCase("packbits", TiffCompression::PackBits);
+
+    runStreamedBlockCase();
 
     runSafetyCases();
     runExceptionTranslationCases();

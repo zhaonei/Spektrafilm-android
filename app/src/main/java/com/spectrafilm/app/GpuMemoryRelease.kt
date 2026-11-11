@@ -26,11 +26,36 @@ internal fun releaseGpuAfterFullResRender(reason: String) {
         .onFailure { Diag.w("gpu resource release after $reason failed: ${it.message}") }
 }
 
-/** True for the failures a reclaim can plausibly cure: budget denial or a native/ART OOM. */
-internal fun isMemoryExhaustion(failure: Throwable): Boolean =
-    failure is OutOfMemoryError ||
-        (failure is RuntimeException &&
-            failure.message?.contains("native allocation failed") == true)
+/**
+ * True for the failures a reclaim can plausibly cure: a budget denial or a native/ART
+ * OOM, including the ones the native encoders report themselves.
+ *
+ * lib:tiffwriter contains `std::bad_alloc` at its JNI boundary and throws it as an
+ * IllegalStateException reading "TIFF write failed: out of memory"; lib:pngwriter does
+ * the same. Neither matches "native allocation failed", so an encoder that ran out of
+ * memory used to reach the user as the generic "try another format or a smaller size"
+ * text instead of the memory text, and skipped the reclaim-and-retry pass. Skipping
+ * that pass is how a 16-bit TIFF export at full resolution failed while the same frame
+ * exported fine as a 16-bit PNG, which needs no image-sized buffer of its own.
+ */
+internal fun isMemoryExhaustion(failure: Throwable): Boolean {
+    if (failure is OutOfMemoryError) return true
+    // Bounded walk: a wrapped cause is common (coroutine/session layers), a cycle is not.
+    var current: Throwable? = failure
+    var depth = 0
+    while (current != null && depth < 8) {
+        val message = current.message?.lowercase().orEmpty()
+        if (message.contains("native allocation failed") ||
+            message.contains("out of memory") ||
+            message.contains("outofmemory")
+        ) {
+            return true
+        }
+        current = current.cause
+        depth++
+    }
+    return false
+}
 
 /** Engine budget snapshot for a failure log; never throws. */
 internal fun memoryBudgetSnapshotForLog(): String =

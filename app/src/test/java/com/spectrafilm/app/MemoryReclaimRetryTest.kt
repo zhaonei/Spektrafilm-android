@@ -81,4 +81,20 @@ class MemoryReclaimRetryTest {
         assertTrue(!isMemoryExhaustion(RuntimeException("decode failed")))
         assertTrue(!isMemoryExhaustion(IllegalStateException()))
     }
+
+    @Test
+    fun `native encoder allocation failures count as memory exhaustion`() {
+        // Exactly what lib:tiffwriter's JNI boundary throws for std::bad_alloc.
+        assertTrue(isMemoryExhaustion(IllegalStateException("TIFF write failed: out of memory")))
+        assertTrue(isMemoryExhaustion(IllegalStateException("PNG write failed: out of memory")))
+        // Wrapped one level, as the export session layer rethrows it.
+        assertTrue(
+            isMemoryExhaustion(
+                RuntimeException("export failed", IllegalStateException("TIFF write failed: out of memory")),
+            ),
+        )
+        // A plain writer rejection must still not be mistaken for memory pressure.
+        assertTrue(!isMemoryExhaustion(IllegalStateException("TIFF write failed: invalid dimensions")))
+        assertTrue(!isMemoryExhaustion(IllegalStateException("cannot publish output")))
+    }
 }

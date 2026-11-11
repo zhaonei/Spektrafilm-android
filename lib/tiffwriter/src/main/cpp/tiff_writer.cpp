@@ -483,41 +483,33 @@ TiffWriteResult publishAtomically(const std::vector<uint8_t>& bytes,
 // header and then the strip without ever holding a second copy of the image: at
 // 12.5 MP that copy is 75 MB, and it existed only to be written out and freed
 // (#175).
-static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int width, int height,
-                                                int bytesPerSample, uint16_t sampleFormatValue,
-                                                const TiffMetadata& meta, TiffCompression compression,
-                                                std::vector<uint8_t>& outBytes,
-                                                const TiffCancellation* cancellation,
-                                                std::vector<uint8_t>* stripOut = nullptr) {
-    TiffWriteResult res;
+// ---- header emission -------------------------------------------------------
+// Every byte of the file EXCEPT the image strip. The strip is always the last
+// span, so `outBytes.size()` when this returns IS the strip's file offset: the
+// in-memory writer appends the strip to it, the file writers stream pixels behind
+// it and never hold the image a second time. Both go through here, so the bytes
+// they produce are identical by construction and #126's container identity holds.
+enum class HeaderStatus { Ok, Cancelled, Error };
+
+static HeaderStatus emitTiffHeader(int width, int height, int bytesPerSample,
+                                  uint16_t sampleFormatValue, const TiffMetadata& meta,
+                                  TiffCompression compression, uint32_t stripByteCount,
+                                  std::vector<uint8_t>& outBytes, std::string& error,
+                                  const TiffCancellation* cancellation) {
     outBytes.clear();
-    MemoryOutputGuard outputGuard(outBytes);
     uint64_t rowSamples64 = 0;
     uint64_t rowBytes64 = 0;
     uint64_t rawStripBytes = 0;
     if (!imageLayout(width, height, static_cast<uint64_t>(bytesPerSample),
-                     rowSamples64, rowBytes64, rawStripBytes, res.error) ||
-        rawStripBytes != static_cast<uint64_t>(raw.size())) {
-        if (res.error.empty()) res.error = "pixel buffer size does not match TIFF layout";
-        return res;
+                     rowSamples64, rowBytes64, rawStripBytes, error)) {
+        return HeaderStatus::Error;
     }
-    if (!validateUncompressedLayout(rawStripBytes, meta, res.error)) return res;
-    if (isCancelled(cancellation)) return cancelledResult();
+    if (!validateUncompressedLayout(rawStripBytes, meta, error)) return HeaderStatus::Error;
+    if (isCancelled(cancellation)) return HeaderStatus::Cancelled;
     const uint16_t bitsValue = static_cast<uint16_t>(bytesPerSample * 8);
-
-    const bool usePackBits = (compression == TiffCompression::PackBits);
-    std::vector<uint8_t> strip;
-    bool stripIsPacked = false;
-    if (usePackBits) {
-        const PackBitsStatus status = packBits(
-            raw.data(), static_cast<size_t>(rowBytes64), height,
-            cancellation, strip);
-        if (status == PackBitsStatus::Cancelled) return cancelledResult();
-        stripIsPacked = status == PackBitsStatus::Packed;
-    }
-    if (!stripIsPacked) strip.swap(raw);
-    const uint16_t compTag = stripIsPacked ? COMPRESSION_PACKBITS : COMPRESSION_NONE;
-    const uint32_t stripByteCount = static_cast<uint32_t>(strip.size());
+    const uint16_t compTag = compression == TiffCompression::PackBits
+                                 ? COMPRESSION_PACKBITS
+                                 : COMPRESSION_NONE;
 
     // --- Decide which baseline entries we emit (sorted by tag below) --------
     struct PendingString { uint16_t tag; std::string s; };
@@ -549,8 +541,8 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
     const uint64_t ifd0Bytes64 = 2u + static_cast<uint64_t>(ifd0Count) * 12u + 4u;
     uint64_t cursor = ifd0Offset64;
     if (!addLayout(cursor, ifd0Bytes64)) {
-        res.error = "TIFF IFD layout exceeds uint32 offsets";
-        return res;
+        error = "TIFF IFD layout exceeds uint32 offsets";
+        return HeaderStatus::Error;
     }
     auto placeAligned = [&](uint64_t bytes, uint64_t& offset) {
         if (!alignLayout(cursor)) return false;
@@ -569,8 +561,8 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
         !placeAligned(6u, sampleFmtOffset64) ||
         !placeAligned(8u, xresOffset64) ||
         !placeAligned(8u, yresOffset64)) {
-        res.error = "TIFF value layout exceeds uint32 offsets";
-        return res;
+        error = "TIFF value layout exceeds uint32 offsets";
+        return HeaderStatus::Error;
     }
 
     // Strings (ASCII, NUL-terminated). <=4 bytes incl. NUL go inline.
@@ -581,8 +573,8 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
         const uint64_t len = static_cast<uint64_t>(ps.s.size()) + 1u;  // include NUL
         StringLoc loc{ps.tag, ps.s, 0, len <= 4};
         if (!loc.inlineVal && !placeAligned(len, loc.offset)) {
-            res.error = "TIFF string layout exceeds uint32 offsets";
-            return res;
+            error = "TIFF string layout exceeds uint32 offsets";
+            return HeaderStatus::Error;
         }
         strLocs.push_back(loc);
     }
@@ -590,8 +582,8 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
     // ICC profile blob.
     uint64_t iccOffset64 = 0;
     if (hasIcc && !placeAligned(meta.iccProfile.size(), iccOffset64)) {
-        res.error = "TIFF ICC layout exceeds uint32 offsets";
-        return res;
+        error = "TIFF ICC layout exceeds uint32 offsets";
+        return HeaderStatus::Error;
     }
 
     // EXIF sub-IFD: lay out its own entries + value pool.
@@ -603,15 +595,15 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
     if (hasExif &&
         !placeAligned(2u + static_cast<uint64_t>(exifCount) * 12u + 4u,
                       exifIfdOffset64)) {
-        res.error = "TIFF EXIF layout exceeds uint32 offsets";
-        return res;
+        error = "TIFF EXIF layout exceeds uint32 offsets";
+        return HeaderStatus::Error;
     }
 
     // Image strip last (word-aligned).
     uint64_t stripOffset64 = 0;
     if (!placeAligned(stripByteCount, stripOffset64)) {
-        res.error = "complete classic TIFF layout exceeds uint32 offsets";
-        return res;
+        error = "complete classic TIFF layout exceeds uint32 offsets";
+        return HeaderStatus::Error;
     }
 
     const uint32_t ifd0Offset = static_cast<uint32_t>(ifd0Offset64);
@@ -624,11 +616,6 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
     const uint32_t stripOffset = static_cast<uint32_t>(stripOffset64);
     const uint32_t fileSize = static_cast<uint32_t>(cursor);
 
-    if (isCancelled(cancellation)) return cancelledResult();
-    auto cancelWithoutPublication = [&outBytes]() {
-        outBytes.clear();
-        return cancelledResult();
-    };
 
     // --- EMIT PASS ----------------------------------------------------------
     outBytes.reserve(fileSize);
@@ -739,8 +726,57 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
         putU32(outBytes, 0);  // next IFD = none
     }
 
-    if (isCancelled(cancellation)) return cancelWithoutPublication();
-    padTo(stripOffset);
+    if (isCancelled(cancellation)) return HeaderStatus::Cancelled;
+    while (outBytes.size() < stripOffset) outBytes.push_back(0);
+    return HeaderStatus::Ok;
+}
+
+static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int width, int height,
+                                                int bytesPerSample, uint16_t sampleFormatValue,
+                                                const TiffMetadata& meta, TiffCompression compression,
+                                                std::vector<uint8_t>& outBytes,
+                                                const TiffCancellation* cancellation,
+                                                std::vector<uint8_t>* stripOut = nullptr) {
+    TiffWriteResult res;
+    outBytes.clear();
+    MemoryOutputGuard outputGuard(outBytes);
+    uint64_t rowSamples64 = 0;
+    uint64_t rowBytes64 = 0;
+    uint64_t rawStripBytes = 0;
+    if (!imageLayout(width, height, static_cast<uint64_t>(bytesPerSample),
+                     rowSamples64, rowBytes64, rawStripBytes, res.error) ||
+        rawStripBytes != static_cast<uint64_t>(raw.size())) {
+        if (res.error.empty()) res.error = "pixel buffer size does not match TIFF layout";
+        return res;
+    }
+    if (!validateUncompressedLayout(rawStripBytes, meta, res.error)) return res;
+    if (isCancelled(cancellation)) return cancelledResult();
+    const bool usePackBits = (compression == TiffCompression::PackBits);
+    std::vector<uint8_t> strip;
+    bool stripIsPacked = false;
+    if (usePackBits) {
+        const PackBitsStatus status = packBits(
+            raw.data(), static_cast<size_t>(rowBytes64), height,
+            cancellation, strip);
+        if (status == PackBitsStatus::Cancelled) return cancelledResult();
+        stripIsPacked = status == PackBitsStatus::Packed;
+    }
+    if (!stripIsPacked) strip.swap(raw);
+    const uint32_t stripByteCount = static_cast<uint32_t>(strip.size());
+
+    const HeaderStatus status = emitTiffHeader(
+        width, height, bytesPerSample, sampleFormatValue, meta,
+        stripIsPacked ? TiffCompression::PackBits : TiffCompression::None,
+        stripByteCount, outBytes, res.error, cancellation);
+    if (status == HeaderStatus::Cancelled) {
+        outBytes.clear();
+        return cancelledResult();
+    }
+    if (status != HeaderStatus::Ok) {
+        outBytes.clear();
+        return res;
+    }
+    // The header already ends exactly at the strip offset.
     if (stripOut != nullptr) {
         // The caller writes the strip straight to the file after this header.
         res.bytesWritten = outBytes.size() + strip.size();
@@ -751,13 +787,19 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
     }
     constexpr size_t kCopyChunk = 64u * 1024u;
     for (size_t offset = 0; offset < strip.size();) {
-        if (isCancelled(cancellation)) return cancelWithoutPublication();
+        if (isCancelled(cancellation)) {
+            outBytes.clear();
+            return cancelledResult();
+        }
         const size_t count = std::min(kCopyChunk, strip.size() - offset);
         outBytes.insert(outBytes.end(), strip.data() + offset,
                         strip.data() + offset + count);
         offset += count;
     }
-    if (isCancelled(cancellation)) return cancelWithoutPublication();
+    if (isCancelled(cancellation)) {
+            outBytes.clear();
+            return cancelledResult();
+        }
 
     res.ok = true;
     res.bytesWritten = outBytes.size();
@@ -845,10 +887,121 @@ TiffWriteResult writeTiff32fToMemory(const float* rgbFloat, int width, int heigh
                                     meta, compression, outBytes, cancellation);
 }
 
+// ---- streaming file writer -------------------------------------------------
+// How the source samples reach the file, per sample: verbatim uint16, verbatim
+// float32, or float32 quantised to uint16 on the way out.
+enum class StreamKind { U16, F32Verbatim, F32Quantised };
+
+// Rows are converted into ONE reusable block and written straight through, so the
+// writer never holds the image. The bound is per block, not per image: a 50 MP
+// 16-bit export used to allocate the whole 300 MB strip (600 MB for float32) on
+// top of the engine's own float render, and that single allocation is what failed
+// on a 12 GB phone while the row-streaming PNG writer on the same frame
+// succeeded. The output bytes are unchanged -- same IFD, same single strip, same
+// offset -- because the strip is still laid out last and its size is analytic.
+constexpr size_t kStreamBlockBytes = 4u * 1024u * 1024u;
+
+static TiffWriteResult streamUncompressedToFile(StreamKind kind, const void* samples,
+                                                int width, int height,
+                                                const TiffMetadata& meta,
+                                                const std::string& path,
+                                                const TiffCancellation* cancellation) {
+    TiffWriteResult res;
+    if (samples == nullptr) {
+        res.error = "null pixel buffer";
+        return res;
+    }
+    if (!TempOutput::validatePath(path, res.error)) return res;
+    const int fileBytesPerSample = kind == StreamKind::F32Verbatim ? 4 : 2;
+    const uint16_t sampleFormatValue = kind == StreamKind::F32Verbatim ? 3 : 1;
+    uint64_t rowSamples64 = 0;
+    uint64_t rowBytes64 = 0;
+    uint64_t rawStripBytes = 0;
+    if (!imageLayout(width, height, static_cast<uint64_t>(fileBytesPerSample),
+                     rowSamples64, rowBytes64, rawStripBytes, res.error)) {
+        return res;
+    }
+
+    std::vector<uint8_t> header;
+    const HeaderStatus status = emitTiffHeader(
+        width, height, fileBytesPerSample, sampleFormatValue, meta,
+        TiffCompression::None, static_cast<uint32_t>(rawStripBytes),
+        header, res.error, cancellation);
+    if (status == HeaderStatus::Cancelled) return cancelledResult();
+    if (status != HeaderStatus::Ok) return res;
+
+    const size_t rowBytes = static_cast<size_t>(rowBytes64);
+    const size_t rowSamples = static_cast<size_t>(rowSamples64);
+    size_t blockRows = rowBytes > 0 ? kStreamBlockBytes / rowBytes : 1u;
+    if (blockRows < 1u) blockRows = 1u;
+    if (blockRows > static_cast<size_t>(height)) blockRows = static_cast<size_t>(height);
+    std::vector<uint8_t> block(rowBytes * blockRows);
+
+    TempOutput output;
+    if (!output.open(path, res.error)) return res;
+    if (isCancelled(cancellation)) return cancelledResult();
+    if (!output.write(header.data(), header.size(), res.error)) return res;
+
+    const float* floats = static_cast<const float*>(samples);
+    const uint16_t* shorts = static_cast<const uint16_t*>(samples);
+    for (int y = 0; y < height;) {
+        if (isCancelled(cancellation)) return cancelledResult();
+        size_t rows = blockRows;
+        if (rows > static_cast<size_t>(height - y)) rows = static_cast<size_t>(height - y);
+        uint8_t* out = block.data();
+        for (size_t r = 0; r < rows; ++r, ++y) {
+            const size_t firstSample = static_cast<size_t>(y) * rowSamples;
+            if (kind == StreamKind::U16) {
+                const uint16_t* src = shorts + firstSample;
+                for (size_t s = 0; s < rowSamples; ++s) {
+                    if ((s & 0x7fffu) == 0u && isCancelled(cancellation))
+                        return cancelledResult();
+                    const uint16_t v = src[s];
+                    *out++ = static_cast<uint8_t>(v & 0xFF);
+                    *out++ = static_cast<uint8_t>((v >> 8) & 0xFF);
+                }
+            } else if (kind == StreamKind::F32Verbatim) {
+                // float32 little-endian: every target and the test host are
+                // little-endian, so the bytes move verbatim, as before.
+                std::memcpy(out, reinterpret_cast<const uint8_t*>(floats + firstSample), rowBytes);
+                out += rowBytes;
+            } else {
+                const float* src = floats + firstSample;
+                for (size_t s = 0; s < rowSamples; ++s) {
+                    if ((s & 0x7fffu) == 0u && isCancelled(cancellation))
+                        return cancelledResult();
+                    // Identical clamp and rounding to the buffered path, including
+                    // NaN -> 0, so the file stays byte-identical (#175, #126).
+                    const float v = src[s];
+                    uint16_t q;
+                    if (!(v > 0.0f)) q = 0;
+                    else if (v >= 1.0f) q = 65535;
+                    else q = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+                    *out++ = static_cast<uint8_t>(q & 0xFF);
+                    *out++ = static_cast<uint8_t>((q >> 8) & 0xFF);
+                }
+            }
+        }
+        if (!output.write(block.data(), rowBytes * rows, res.error)) return res;
+    }
+    if (isCancelled(cancellation)) return cancelledResult();
+    if (!output.commit(path, res.error)) return res;
+    res.ok = true;
+    res.bytesWritten = header.size() + static_cast<size_t>(rawStripBytes);
+    return res;
+}
+
 TiffWriteResult writeTiff16ToFile(const uint16_t* rgb16, int width, int height,
                                   const TiffMetadata& meta, TiffCompression compression,
                                   const std::string& path,
                                   const TiffCancellation* cancellation) {
+    // Uncompressed is the export path (the app passes packBits=false): stream it.
+    // PackBits keeps the buffered form below, because the encoder has to see the
+    // whole strip to decide whether packing pays off at all.
+    if (compression == TiffCompression::None) {
+        return streamUncompressedToFile(StreamKind::U16, rgb16, width, height, meta,
+                                        path, cancellation);
+    }
     TiffWriteResult pathResult;
     if (!TempOutput::validatePath(path, pathResult.error)) return pathResult;
     // Header and strip are written as two spans, so the whole file is never
@@ -865,6 +1018,12 @@ TiffWriteResult writeTiff32fToFile(const float* rgbFloat, int width, int height,
                                    const TiffMetadata& meta, TiffCompression compression,
                                    const std::string& path,
                                    const TiffCancellation* cancellation) {
+    // 32-bit float is 4 bytes per sample in the FILE too: 600 MB of strip at 50 MP,
+    // which is the heaviest allocation in the app. Stream it whenever we can.
+    if (compression == TiffCompression::None) {
+        return streamUncompressedToFile(StreamKind::F32Verbatim, rgbFloat, width, height,
+                                        meta, path, cancellation);
+    }
     TiffWriteResult pathResult;
     if (!TempOutput::validatePath(path, pathResult.error)) return pathResult;
     std::vector<uint8_t> bytes;
@@ -886,6 +1045,12 @@ TiffWriteResult writeTiffFloatToFile(const float* rgbFloat, int width, int heigh
                                      const TiffMetadata& meta, TiffCompression compression,
                                      const std::string& path,
                                      const TiffCancellation* cancellation) {
+    // The 16-bit export path: quantise row-by-row straight into the file instead of
+    // building a full uint16 image first (300 MB at 50 MP).
+    if (compression == TiffCompression::None) {
+        return streamUncompressedToFile(StreamKind::F32Quantised, rgbFloat, width, height,
+                                        meta, path, cancellation);
+    }
     TiffWriteResult res;
     if (!TempOutput::validatePath(path, res.error)) return res;
     if (rgbFloat == nullptr) { res.error = "null float buffer"; return res; }
