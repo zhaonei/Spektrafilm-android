@@ -11,7 +11,8 @@ import androidx.test.uiautomator.Direction
 import androidx.test.uiautomator.UiObject2
 import androidx.test.uiautomator.Until
 
-const val TARGET_PACKAGE = "com.spectrafilm.app"
+// Fork: the app id of this fork's build (see app/build.gradle.kts).
+const val TARGET_PACKAGE = "com.zhaonei.spektrafilm"
 
 private const val WAIT_MS = 10_000L
 

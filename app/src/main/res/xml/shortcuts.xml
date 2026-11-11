@@ -11,7 +11,7 @@
         android:shortcutLongLabel="@string/shortcut_open_photo_long">
         <intent
             android:action="com.spectrafilm.app.action.SHORTCUT_OPEN_PHOTO"
-            android:targetPackage="com.spectrafilm.app"
+            android:targetPackage="com.zhaonei.spektrafilm"
             android:targetClass="com.spectrafilm.app.MainActivity" />
     </shortcut>
     <shortcut
@@ -22,7 +22,7 @@
         android:shortcutLongLabel="@string/shortcut_library_long">
         <intent
             android:action="com.spectrafilm.app.action.SHORTCUT_LIBRARY"
-            android:targetPackage="com.spectrafilm.app"
+            android:targetPackage="com.zhaonei.spektrafilm"
             android:targetClass="com.spectrafilm.app.MainActivity" />
     </shortcut>
 </shortcuts>

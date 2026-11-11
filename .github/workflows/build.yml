@@ -8,11 +8,13 @@
 #
 # What it does:
 #   1. targeted unit test for the preview sizing table that this fork changed;
-#   2. :app:assembleRelease -> UNSIGNED, minified APK (R8 on, as upstream ships);
+#   2. :app:assembleRelease -> UNSIGNED, minified APK (R8 on, as upstream ships),
+#      versionCode = 15 + run number so every build is a real upgrade;
 #   3. zipalign -P 16 (16 KB page alignment for the bundled .so) then apksigner
-#      with v1 AND v2 AND v3 ALL forced on -- v1 is off by default at minSdk 24,
-#      and this is the one knob an OEM installer can be fussy about;
-#   4. verify the three schemes and the signer fingerprint;
+#      with v1 (JAR) AND v2 forced on; v3 deliberately OFF, matching the recipe
+#      that is already proven to install on the target phone;
+#   4. verify with --min-sdk-version 18 (below 24 is what makes apksigner actually
+#      check the v1 JAR signature) and print the signer fingerprint;
 #   5. upload the APK as a workflow artifact and attach it to a Release.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
@@ -21,9 +23,10 @@
 #   SIGNING_KEYSTORE_PASSWORD  store password
 #   SIGNING_KEY_PASSWORD       key password (same as store for PKCS12)
 #
-# NOTE ON UPDATES: this fork signs with its own key, so an APK installed from the
-# upstream release cannot be upgraded over -- uninstall it once. Every build from
-# this workflow can then be installed over the previous one.
+# NOTE ON UPDATES: this fork has its own applicationId (com.zhaonei.spektrafilm),
+# so it installs BESIDE the upstream app rather than over it. Installing a
+# differently-signed APK over an existing app with the same id is impossible --
+# and an OEM installer reports exactly that as "the package cannot be parsed".
 name: Build
 
 on:
@@ -78,7 +81,11 @@ jobs:
           # Repository secrets supply the key, so there is deliberately no
           # keystore.properties in the tree: Gradle must emit an unsigned APK.
           test ! -e keystore.properties
-          ./gradlew :app:assembleRelease --stacktrace
+          # Monotonic versionCode (15 + run number) so each build installs as an
+          # update over the previous one instead of colliding with it.
+          ./gradlew :app:assembleRelease \
+            -PforkVersionCode=$((15 + GITHUB_RUN_NUMBER)) \
+            --stacktrace
           APK=app/build/outputs/apk/release/app-release-unsigned.apk
           test -f "$APK"
           if "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$APK" >/dev/null 2>&1; then
@@ -86,6 +93,10 @@ jobs:
             exit 1
           fi
           echo "unsigned APK: $(du -h "$APK" | cut -f1)"
+          # What the installer will actually see. Printed so this log answers
+          # "what package / version did you build" without re-running anything.
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" \
+            | grep -E "^package:|^sdkVersion|^targetSdkVersion|^application-label:"
 
       - name: Align, sign v1+v2+v3, verify
         env:
@@ -124,37 +135,43 @@ jobs:
             --min-sdk-version 24 \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
-            --v3-signing-enabled true \
+            --v3-signing-enabled false \
             --out "out/$NAME" out/aligned.apk
 
           rm -f "$KS"
 
           "$BT/zipalign" -c -v -P 16 4 "out/$NAME"
-          # Verify with an API level BELOW 24 on purpose. apksigner only checks --
-          # and therefore only reports -- the v1 JAR signature when the target
-          # platform needs it (minSdk < 24). Verifying at the manifest's own 24
-          # prints "v1: false" even for an APK that carries a valid META-INF/*.SF
-          # signature, which is exactly what happened on the first run.
+          # --min-sdk-version 18, exactly like the recipe that already installs on
+          # this phone: apksigner only checks (and therefore only reports) the v1
+          # JAR signature when the target platform needs it, i.e. below 24.
           "$BT/apksigner" verify --verbose --print-certs \
-            --min-sdk-version 23 "out/$NAME" | tee out/verify.txt
+            --min-sdk-version 18 "out/$NAME" | tee out/verify.txt
 
           grep -q "Verified using v1 scheme (JAR signing): true" out/verify.txt
           grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" out/verify.txt
-          grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" out/verify.txt
+          grep -q "Verified using v3 scheme (APK Signature Scheme v3): false" out/verify.txt
           grep -q "^Number of signers: 1$" out/verify.txt
           unzip -l "out/$NAME" | grep -q "META-INF/.*\\.RSA"
+
+          "$BT/aapt" dump badging "out/$NAME" | grep -E "^package:"
 
           {
             echo "versionName: $VERSION_NAME"
             echo "run: $GITHUB_RUN_NUMBER"
             echo "commit: $GITHUB_SHA"
-            echo "signing: v1 (JAR) + v2 + v3, all verified"
+            echo "signing: v1 (JAR) + v2, both verified at --min-sdk-version 18"
           } > out/BUILD_INFO.txt
           sha256sum "out/$NAME" > out/SHA256SUMS.txt
           cat out/SHA256SUMS.txt
 
-          echo "SIGNED_APK=out/$NAME" >> "$GITHUB_ENV"
-          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          VERSION_CODE="$("$BT/aapt" dump badging "out/$NAME" | sed -n "s/^package:.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)"
+          APK_SHA256="$(sha256sum "out/$NAME" | cut -d' ' -f1)"
+          {
+            echo "SIGNED_APK=out/$NAME"
+            echo "VERSION_NAME=$VERSION_NAME"
+            echo "VERSION_CODE=$VERSION_CODE"
+            echo "APK_SHA256=$APK_SHA256"
+          } >> "$GITHUB_ENV"
 
       - name: Signing material cleanup
         if: always()
@@ -184,14 +201,24 @@ jobs:
           body: |
             Personal fork build of [Spektrafilm](https://github.com/thetechgeekko/Spektrafilm-android) (GPLv3).
 
-            * versionName `${{ env.VERSION_NAME }}`, workflow run `${{ github.run_number }}`
-            * commit `${{ github.sha }}`
-            * signed with v1 (JAR) **and** v2 **and** v3, all three verified by `apksigner`
-            * 16 KB page-aligned (`zipalign -P 16`)
+            * **app id `com.zhaonei.spektrafilm`** — installs alongside the upstream
+              release, does not replace it. No uninstall needed, no signature clash.
+            * versionCode `${{ env.VERSION_CODE }}`, versionName `${{ env.VERSION_NAME }}`
+            * workflow run `${{ github.run_number }}`, commit `${{ github.sha }}`
+            * signed v1 (JAR) + v2 with this fork's own key, both verified by `apksigner`
+              (`--min-sdk-version 18`, the same check the recipe that already installs uses)
+            * `zipalign -P 16` (16 KB page aligned)
 
-            Signed with this fork's own key, so uninstall any upstream-release build
-            once before installing this one. Later builds from this workflow install
-            over it directly.
+            Check the download is intact before installing — the SHA-256 of the APK is
+            in `SHA256SUMS.txt` next to it:
+
+            ```
+            ${{ env.APK_SHA256 }}
+            ```
+
+            If the phone still says the package cannot be parsed, first install the
+            upstream release alongside it (`com.spectrafilm.app`), then remove this one;
+            that separates "our build" from "the phone".
           files: |
             ${{ env.SIGNED_APK }}
             out/SHA256SUMS.txt

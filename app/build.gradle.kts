@@ -24,6 +24,10 @@ val keystoreProps = Properties().apply {
 val hasReleaseKeystore = keystorePropsFile.exists() &&
     keystoreProps.getProperty("storeFile") != null
 
+// Fork: the CI passes -PforkVersionCode so every published build is a real
+// upgrade over the last one. Absent the property the shipped value is unchanged.
+val forkVersionCode: Int = providers.gradleProperty("forkVersionCode").orNull?.toIntOrNull() ?: 15
+
 android {
     namespace = "com.spectrafilm.app"
     // The app module strips the packaged .so with this NDK's llvm-strip. AGP 9 defaults to
@@ -48,10 +52,18 @@ android {
     buildToolsVersion = "36.0.0"
 
     defaultConfig {
-        applicationId = "com.spectrafilm.app"
+        // Fork: this build is its own app id, so it installs ALONGSIDE the upstream
+        // release instead of fighting it. Same package name with a different signing
+        // key cannot be installed over an existing install at all -- the OEM installer
+        // reports that as a parse failure -- and re-signing cannot fix it either.
+        // The Kotlin namespace stays com.spectrafilm.app: no source moved.
+        applicationId = "com.zhaonei.spektrafilm"
         minSdk = 24
         targetSdk = 36
-        versionCode = 15
+        // Fork: the CI passes -PforkVersionCode so every run is a real upgrade.
+        // Android refuses to install the same versionCode twice over itself on some
+        // OEMs; without this every rebuild would need an uninstall first.
+        versionCode = forkVersionCode
         versionName = "1.0.0"
         testInstrumentationRunner = "com.spectrafilm.app.ReleaseCandidateSmokeInstrumentation"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
