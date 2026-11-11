@@ -33,14 +33,24 @@ internal enum class PreviewTier { LOW, BASELINE, HIGH, MAX }
 
 internal data class AutoPreviewEdges(
     val tier: PreviewTier,
-    /** Settle preview long edge; inside the existing 128..1024 slider range. */
+    /** Settle preview long edge; inside the existing 128..1440 slider range. */
     val previewEdge: Int,
     /** Starting live-draft long edge; inside the existing 128..512 draft range. */
     val draftEdge: Int,
 )
 
 internal const val PREVIEW_EDGE_MIN = 256
-internal const val PREVIEW_EDGE_MAX = 1024
+
+/**
+ * Settle-preview ceiling. Raised from 1024 to 1440 for this fork: on a 1.5K phone
+ * screen the 1024 edge was the visible limit on sharpness at fit zoom (the photo is
+ * upscaled to ~1260 px wide), and 1440 clears 1:1 with the panel. Only the MAX tier
+ * (12 GB+ RAM) reaches it, and the existing screen cap keeps it under the display's
+ * own long edge, so no smaller device asks for more than it did before.
+ * The cost is per-pixel: a 1440 edge is ~1.98x the pixels of 1024, paid on the settle
+ * pass only (drafts are unchanged). App-side only — no engine math changes.
+ */
+internal const val PREVIEW_EDGE_MAX = 1440
 internal const val DRAFT_EDGE_MIN = 128
 internal const val DRAFT_EDGE_MAX = 512
 private const val EDGE_STEP = 64
@@ -78,7 +88,7 @@ internal fun autoPreviewEdges(p: DeviceRenderProfile): AutoPreviewEdges {
         PreviewTier.LOW -> 512 to 256
         PreviewTier.BASELINE -> 640 to DRAFT_RENDER_MAX_PX
         PreviewTier.HIGH -> 896 to 448
-        PreviewTier.MAX -> 1024 to 512
+        PreviewTier.MAX -> 1440 to 512
     }
     // No point rendering a preview much larger than the screen can show at fit zoom.
     val screenCap = if (p.displayLongEdgePx > 0) {

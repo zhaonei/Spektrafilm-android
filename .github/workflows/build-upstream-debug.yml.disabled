@@ -1,0 +1,175 @@
+# Lean everyday CI, modelled on adityawarmanfw/rawr's single debug.yml job.
+#
+# When it runs (kept small to save Actions minutes):
+#   • push to main            — every merge gets one debug build.
+#   • pull request            — ONLY when the PR carries the `run-ci` label.
+#                               PRs are normally reviewed by Codex instead of CI;
+#                               add the label as the fallback when that review
+#                               is unavailable. Later pushes to a labelled PR
+#                               re-run it; remove the label to stop.
+#   • manual dispatch         — Actions → Build → Run workflow (any branch).
+#
+# What it runs: one job — JVM unit tests + debug APK for all ABIs, uploaded as
+# an artifact. The host engine-parity suite (-O2 leg, 44 cases, same table as
+# ci.yml) runs in the same job ONLY when the change touches the engine or the
+# parity tooling, or on manual dispatch, so app-only changes stay cheap.
+#
+# The exhaustive gate set (sanitizers, LibRaw fuzzing, both parity legs, lint,
+# 16 KB alignment, emulator) lives in ci.yml, which is manual-dispatch only,
+# and release.yml reruns the release-critical gates before any signing.
+#
+# Film modeling powered by spektrafilm (GPLv3).
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (unit tests + debug APK)
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect engine changes
+        id: engine
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) from="$BASE" ;;
+            push) from="$BEFORE" ;;
+            *) from="" ;;
+          esac
+          # Manual dispatch, a new ref, or an unreachable base (force push):
+          # run the suite rather than guess.
+          if [ -z "$from" ] || ! git cat-file -e "$from^{commit}" 2>/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$from" HEAD \
+              | grep -qE '^(engine/spektra-core/src/main/cpp/|engine/spektra-core/src/main/assets/|tools/parity/)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Engine parity (-O2, 44 cases)
+        if: steps.engine.outputs.changed == 'true'
+        run: bash tools/parity/run_engine_parity.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Explicit packages: the action's default list names the removed `tools`
+      # package. Pins match app/build.gradle.kts and docs/EXECUTION_INDEX.md.
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools ndk;28.2.13676358 cmake;3.22.1 build-tools;36.0.0 platforms;android-37.0
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Dependency locking is STRICT, so a version bump needs fresh lockfiles, and
+      # writing them needs Google Maven, which agent sandboxes cannot reach. Label a
+      # PR `write-locks` to regenerate every module's lockfile here, print the diff and
+      # each rewritten file to the log; copy them into the PR, then remove the label.
+      # The steps below then build against the rewritten locks.
+      - name: Rewrite dependency locks (write-locks label only)
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'write-locks')
+        run: |
+          chmod +x ./gradlew
+          # Every module's lockfile: a plugin bump (AGP, Kotlin) changes the
+          # build-tool configurations locked in all of them, not only :app's.
+          ./gradlew :app:dependencies :engine:spektra-core:dependencies \
+            :lib:libraw:dependencies :lib:tiffwriter:dependencies \
+            :lib:pngwriter:dependencies :baselineprofile:dependencies \
+            --write-locks -q > /dev/null
+          echo "----- BEGIN LOCKFILE DIFF -----"
+          git diff --stat -- '*.lockfile'
+          git ls-files --others --exclude-standard -- '*.lockfile'
+          echo "----- END LOCKFILE DIFF -----"
+          # A new module's lockfile is untracked, so list those as well.
+          for f in $( (git diff --name-only -- '*.lockfile'; \
+                       git ls-files --others --exclude-standard -- '*.lockfile') | sort -u); do
+            echo "===== BEGIN $f ====="
+            cat "$f"
+            echo "===== END $f ====="
+          done
+
+      - name: Unit tests
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:testDebugUnitTest --stacktrace
+
+      # Screenshot tests (MAD audit fix 5). AGP names the suite's tasks
+      # update/test{Suite}{Target}{Variant}TestSuite; the target part is AGP's, so the
+      # names are looked up rather than hard-coded. A PR labelled `write-screenshots`
+      # regenerates the reference images and uploads them as an artifact to review and
+      # commit; every run then checks against the committed references.
+      - name: Find screenshot test tasks
+        id: shots
+        run: |
+          ./gradlew -q :app:tasks --all > /tmp/app-tasks.txt
+          grep -iE 'screenshot|TestSuite' /tmp/app-tasks.txt || true
+          upd=$(grep -oE '^update\S*Screenshot\S*TestSuite\b' /tmp/app-tasks.txt | grep -i debug | head -1)
+          tst=$(grep -oE '^test\S*Screenshot\S*TestSuite\b' /tmp/app-tasks.txt | grep -i debug | head -1)
+          if [ -z "$upd" ] || [ -z "$tst" ]; then echo "::error::screenshot suite tasks not found"; exit 1; fi
+          echo "update=$upd" >> "$GITHUB_OUTPUT"
+          echo "test=$tst" >> "$GITHUB_OUTPUT"
+
+      - name: Update screenshot references (write-screenshots label only)
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'write-screenshots')
+        run: ./gradlew ":app:${{ steps.shots.outputs.update }}" --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'write-screenshots')
+        with:
+          name: screenshot-references
+          path: app/src/screenshotTest*/reference/
+          retention-days: 7
+
+      - name: Screenshot tests
+        run: ./gradlew ":app:${{ steps.shots.outputs.test }}" --stacktrace
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spektrafilm-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore

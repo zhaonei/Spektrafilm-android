@@ -236,7 +236,10 @@ internal fun SettingsScreen(
                         SavedOnReleaseSlider(
                             label = stringResource(R.string.screen_settings_preview_max_size),
                             value = state.previewMaxSize,
-                            range = 128..1024,
+                            // Fork: was 128..1024. Matches the raised
+                            // PREVIEW_EDGE_MAX so the manual size and the Auto
+                            // size can reach the same ceiling.
+                            range = 128..1440,
                             onCommit = { onAction(SettingsAction.SetPreviewMaxSize(it)) },
                             tooltip = stringResource(R.string.screen_settings_preview_max_size_tip),
                         )

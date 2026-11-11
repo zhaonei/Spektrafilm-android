@@ -1,175 +1,190 @@
-# Lean everyday CI, modelled on adityawarmanfw/rawr's single debug.yml job.
+# Personal fork build: push to main -> signed APK -> GitHub Release.
 #
-# When it runs (kept small to save Actions minutes):
-#   • push to main            — every merge gets one debug build.
-#   • pull request            — ONLY when the PR carries the `run-ci` label.
-#                               PRs are normally reviewed by Codex instead of CI;
-#                               add the label as the fallback when that review
-#                               is unavailable. Later pushes to a labelled PR
-#                               re-run it; remove the label to stop.
-#   • manual dispatch         — Actions → Build → Run workflow (any branch).
+# Fork of thetechgeekko/Spektrafilm-android (GPLv3). This workflow replaces the
+# upstream debug CI in this fork only; the upstream copy is kept next to it as
+# build-upstream-debug.yml.disabled for reference. The app itself is unmodified
+# except for the preview ceiling (see the commit), so all engine, parity and
+# accuracy properties of the upstream project still hold.
 #
-# What it runs: one job — JVM unit tests + debug APK for all ABIs, uploaded as
-# an artifact. The host engine-parity suite (-O2 leg, 44 cases, same table as
-# ci.yml) runs in the same job ONLY when the change touches the engine or the
-# parity tooling, or on manual dispatch, so app-only changes stay cheap.
+# What it does:
+#   1. targeted unit test for the preview sizing table that this fork changed;
+#   2. :app:assembleRelease -> UNSIGNED, minified APK (R8 on, as upstream ships);
+#   3. zipalign -P 16 (16 KB page alignment for the bundled .so) then apksigner
+#      with v1 AND v2 AND v3 ALL forced on -- v1 is off by default at minSdk 24,
+#      and this is the one knob an OEM installer can be fussy about;
+#   4. verify the three schemes and the signer fingerprint;
+#   5. upload the APK as a workflow artifact and attach it to a Release.
 #
-# The exhaustive gate set (sanitizers, LibRaw fuzzing, both parity legs, lint,
-# 16 KB alignment, emulator) lives in ci.yml, which is manual-dispatch only,
-# and release.yml reruns the release-critical gates before any signing.
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   SIGNING_KEYSTORE           base64 of the release keystore (.jks)
+#   SIGNING_KEY_ALIAS          keystore alias
+#   SIGNING_KEYSTORE_PASSWORD  store password
+#   SIGNING_KEY_PASSWORD       key password (same as store for PKCS12)
 #
-# Film modeling powered by spektrafilm (GPLv3).
+# NOTE ON UPDATES: this fork signs with its own key, so an APK installed from the
+# upstream release cannot be upgraded over -- uninstall it once. Every build from
+# this workflow can then be installed over the previous one.
 name: Build
 
 on:
   push:
     branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: fork-signed-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build (unit tests + debug APK)
-    if: >-
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    name: Build + sign (v1/v2/v3) + publish
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      - name: Detect engine changes
-        id: engine
-        env:
-          EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          case "$EVENT" in
-            pull_request) from="$BASE" ;;
-            push) from="$BEFORE" ;;
-            *) from="" ;;
-          esac
-          # Manual dispatch, a new ref, or an unreachable base (force push):
-          # run the suite rather than guess.
-          if [ -z "$from" ] || ! git cat-file -e "$from^{commit}" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$from" HEAD \
-              | grep -qE '^(engine/spektra-core/src/main/cpp/|engine/spektra-core/src/main/assets/|tools/parity/)'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Engine parity (-O2, 44 cases)
-        if: steps.engine.outputs.changed == 'true'
-        run: bash tools/parity/run_engine_parity.sh
+          fetch-depth: 1
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
 
-      # Explicit packages: the action's default list names the removed `tools`
-      # package. Pins match app/build.gradle.kts and docs/EXECUTION_INDEX.md.
+      # Same pins as app/build.gradle.kts: ndkVersion 28.2.13676358,
+      # buildToolsVersion 36.0.0, compileSdk 37, cmake 3.22.1.
       - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools ndk;28.2.13676358 cmake;3.22.1 build-tools;36.0.0 platforms;android-37.0
 
       - uses: gradle/actions/setup-gradle@v4
 
-      # Dependency locking is STRICT, so a version bump needs fresh lockfiles, and
-      # writing them needs Google Maven, which agent sandboxes cannot reach. Label a
-      # PR `write-locks` to regenerate every module's lockfile here, print the diff and
-      # each rewritten file to the log; copy them into the PR, then remove the label.
-      # The steps below then build against the rewritten locks.
-      - name: Rewrite dependency locks (write-locks label only)
-        if: >-
-          github.event_name == 'pull_request' &&
-          contains(github.event.pull_request.labels.*.name, 'write-locks')
+      # The only logic this fork touches. Fast, and it gates the APK so a bad
+      # preview table can never be published.
+      - name: Preview sizing unit tests
         run: |
+          set -euo pipefail
           chmod +x ./gradlew
-          # Every module's lockfile: a plugin bump (AGP, Kotlin) changes the
-          # build-tool configurations locked in all of them, not only :app's.
-          ./gradlew :app:dependencies :engine:spektra-core:dependencies \
-            :lib:libraw:dependencies :lib:tiffwriter:dependencies \
-            :lib:pngwriter:dependencies :baselineprofile:dependencies \
-            --write-locks -q > /dev/null
-          echo "----- BEGIN LOCKFILE DIFF -----"
-          git diff --stat -- '*.lockfile'
-          git ls-files --others --exclude-standard -- '*.lockfile'
-          echo "----- END LOCKFILE DIFF -----"
-          # A new module's lockfile is untracked, so list those as well.
-          for f in $( (git diff --name-only -- '*.lockfile'; \
-                       git ls-files --others --exclude-standard -- '*.lockfile') | sort -u); do
-            echo "===== BEGIN $f ====="
-            cat "$f"
-            echo "===== END $f ====="
-          done
+          ./gradlew :app:testDebugUnitTest \
+            --tests "com.spectrafilm.app.AdaptivePreviewTest" \
+            --stacktrace
 
-      - name: Unit tests
+      - name: Assemble unsigned release
         run: |
+          set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew :app:testDebugUnitTest --stacktrace
+          # Repository secrets supply the key, so there is deliberately no
+          # keystore.properties in the tree: Gradle must emit an unsigned APK.
+          test ! -e keystore.properties
+          ./gradlew :app:assembleRelease --stacktrace
+          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          test -f "$APK"
+          if "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$APK" >/dev/null 2>&1; then
+            echo "::error::The Gradle build unexpectedly produced a signed APK"
+            exit 1
+          fi
+          echo "unsigned APK: $(du -h "$APK" | cut -f1)"
 
-      # Screenshot tests (MAD audit fix 5). AGP names the suite's tasks
-      # update/test{Suite}{Target}{Variant}TestSuite; the target part is AGP's, so the
-      # names are looked up rather than hard-coded. A PR labelled `write-screenshots`
-      # regenerates the reference images and uploads them as an artifact to review and
-      # commit; every run then checks against the committed references.
-      - name: Find screenshot test tasks
-        id: shots
+      - name: Align, sign v1+v2+v3, verify
+        env:
+          SIGNING_KEYSTORE: ${{ secrets.SIGNING_KEYSTORE }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          ./gradlew -q :app:tasks --all > /tmp/app-tasks.txt
-          grep -iE 'screenshot|TestSuite' /tmp/app-tasks.txt || true
-          upd=$(grep -oE '^update\S*Screenshot\S*TestSuite\b' /tmp/app-tasks.txt | grep -i debug | head -1)
-          tst=$(grep -oE '^test\S*Screenshot\S*TestSuite\b' /tmp/app-tasks.txt | grep -i debug | head -1)
-          if [ -z "$upd" ] || [ -z "$tst" ]; then echo "::error::screenshot suite tasks not found"; exit 1; fi
-          echo "update=$upd" >> "$GITHUB_OUTPUT"
-          echo "test=$tst" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          : "${SIGNING_KEYSTORE:?secret SIGNING_KEYSTORE is empty or missing}"
+          : "${SIGNING_KEY_ALIAS:?secret SIGNING_KEY_ALIAS is empty or missing}"
+          : "${SIGNING_KEYSTORE_PASSWORD:?secret SIGNING_KEYSTORE_PASSWORD is empty or missing}"
+          : "${SIGNING_KEY_PASSWORD:?secret SIGNING_KEY_PASSWORD is empty or missing}"
 
-      - name: Update screenshot references (write-screenshots label only)
-        if: >-
-          github.event_name == 'pull_request' &&
-          contains(github.event.pull_request.labels.*.name, 'write-screenshots')
-        run: ./gradlew ":app:${{ steps.shots.outputs.update }}" --stacktrace
+          KS="$RUNNER_TEMP/fork-signing-${GITHUB_RUN_ID}.jks"
+          ( umask 077; printf '%s' "$SIGNING_KEYSTORE" | base64 -d > "$KS" )
+          test -s "$KS"
+
+          VERSION_NAME="$("$BT/aapt" dump badging "$APK" \
+            | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+          test -n "$VERSION_NAME"
+          NAME="Spektrafilm-fork-${VERSION_NAME}-${GITHUB_RUN_NUMBER}.apk"
+          mkdir -p out
+
+          # 16 KB page alignment first (build-tools 35+ supports -P 16); the
+          # bundled libspektra.so is then mmap-able on 16 KB-page devices.
+          "$BT/zipalign" -f -P 16 4 "$APK" out/aligned.apk
+
+          "$BT/apksigner" sign \
+            --ks "$KS" \
+            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --ks-pass env:SIGNING_KEYSTORE_PASSWORD \
+            --key-pass env:SIGNING_KEY_PASSWORD \
+            --min-sdk-version 24 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "out/$NAME" out/aligned.apk
+
+          rm -f "$KS"
+
+          "$BT/zipalign" -c -v -P 16 4 "out/$NAME"
+          "$BT/apksigner" verify --verbose --print-certs "out/$NAME" | tee out/verify.txt
+
+          grep -q "Verified using v1 scheme (JAR signing): true" out/verify.txt
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" out/verify.txt
+          grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" out/verify.txt
+
+          {
+            echo "versionName: $VERSION_NAME"
+            echo "run: $GITHUB_RUN_NUMBER"
+            echo "commit: $GITHUB_SHA"
+            echo "signing: v1 (JAR) + v2 + v3, all verified"
+          } > out/BUILD_INFO.txt
+          sha256sum "out/$NAME" > out/SHA256SUMS.txt
+          cat out/SHA256SUMS.txt
+
+          echo "SIGNED_APK=out/$NAME" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+
+      - name: Signing material cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP"/fork-signing-*.jks
+          if git ls-files --others --exclude-standard -- '*.jks' '*.keystore' keystore.properties | grep -q .; then
+            echo "::error::Signing material leaked into the workspace"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
-        if: >-
-          github.event_name == 'pull_request' &&
-          contains(github.event.pull_request.labels.*.name, 'write-screenshots')
         with:
-          name: screenshot-references
-          path: app/src/screenshotTest*/reference/
-          retention-days: 7
+          name: spektrafilm-fork-${{ github.run_number }}
+          path: |
+            out/*.apk
+            out/SHA256SUMS.txt
+            out/BUILD_INFO.txt
+            out/verify.txt
+          retention-days: 30
 
-      - name: Screenshot tests
-        run: ./gradlew ":app:${{ steps.shots.outputs.test }}" --stacktrace
-
-      - name: Assemble debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
-
-      - uses: actions/upload-artifact@v4
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: spektrafilm-debug-${{ github.sha }}
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 14
+          tag_name: fork.${{ github.run_number }}
+          name: Spektrafilm fork build ${{ github.run_number }} (v${{ env.VERSION_NAME }})
+          body: |
+            Personal fork build of [Spektrafilm](https://github.com/thetechgeekko/Spektrafilm-android) (GPLv3).
 
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: test-reports
-          path: app/build/reports/tests/
-          if-no-files-found: ignore
+            * versionName `${{ env.VERSION_NAME }}`, workflow run `${{ github.run_number }}`
+            * commit `${{ github.sha }}`
+            * signed with v1 (JAR) **and** v2 **and** v3, all three verified by `apksigner`
+            * 16 KB page-aligned (`zipalign -P 16`)
+
+            Signed with this fork's own key, so uninstall any upstream-release build
+            once before installing this one. Later builds from this workflow install
+            over it directly.
+          files: |
+            ${{ env.SIGNED_APK }}
+            out/SHA256SUMS.txt
+          fail_on_unmatched_files: true
