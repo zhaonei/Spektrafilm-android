@@ -36,10 +36,20 @@ import kotlinx.coroutines.launch
 object Diag {
     const val TAG = "Spektra"
 
-    fun i(msg: String) = Log.i(TAG, msg)
-    fun w(msg: String) = Log.w(TAG, msg)
+    /**
+     * android.util.Log is a stub under the JVM unit tests and throws "not mocked", so an
+     * unguarded log line is enough to fail a test that exercises the code around it -- the
+     * export commit state machine, for one. Diagnostics must never be the reason a code path
+     * fails, and the guard costs one allocation on lines that are never in a pixel loop.
+     */
+    private inline fun guarded(crossinline block: () -> Unit) {
+        runCatching { block() }
+    }
+
+    fun i(msg: String) = guarded { Log.i(TAG, msg) }
+    fun w(msg: String) = guarded { Log.w(TAG, msg) }
     fun e(msg: String, t: Throwable? = null) {
-        if (t != null) Log.e(TAG, msg, t) else Log.e(TAG, msg)
+        guarded { if (t != null) Log.e(TAG, msg, t) else Log.e(TAG, msg) }
     }
 }
 
