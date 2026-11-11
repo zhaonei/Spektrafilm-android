@@ -73,13 +73,14 @@ jobs:
           g++ -std=c++17 -O2 -I. tests/test_tiff_writer.cpp tiff_writer.cpp -o "$RUNNER_TEMP/test_tiff_writer"
           "$RUNNER_TEMP/test_tiff_writer"
 
-      - name: Preview sizing + memory classification unit tests
+      - name: Preview sizing + memory + export publication unit tests
         run: |
           set -euo pipefail
           chmod +x ./gradlew
           ./gradlew :app:testDebugUnitTest \
             --tests "com.spectrafilm.app.AdaptivePreviewTest" \
             --tests "com.spectrafilm.app.MemoryReclaimRetryTest" \
+            --tests "com.spectrafilm.app.ExportTransactionTest" \
             --stacktrace
 
       - name: Assemble unsigned release

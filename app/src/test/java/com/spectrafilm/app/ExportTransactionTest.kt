@@ -395,6 +395,145 @@ class ExportTransactionTest {
         assertEquals(StoredExportState.PENDING, backend.state("retry-token"))
     }
 
+
+    // --- reserveVisiblePendingRow: the provider may accept an insert and drop the row ---
+
+    private fun spec(mime: String, relativePath: String) =
+        ExportDestinationSpec(displayName = "Spektrafilm", mimeType = mime, relativePath = relativePath)
+
+    @Test
+    fun reserveVisiblePendingRow_keepsTheFirstCandidateWhenTheRowSurvives() {
+        val inserts = mutableListOf<ExportDestinationSpec>()
+        val deletes = mutableListOf<String>()
+
+        val (token, chosen) = reserveVisiblePendingRow(
+            specs = listOf(
+                spec("image/png", "Pictures/Spektrafilm"),
+                spec("image/png", "Download/Spektrafilm"),
+            ),
+            insert = { s -> inserts += s; "token-${inserts.size}" },
+            state = { StoredExportState.PENDING },
+            delete = { deletes += it; 1 },
+            sleeper = {},
+        )
+
+        assertEquals("token-1", token)
+        assertEquals("Pictures/Spektrafilm", chosen.relativePath)
+        assertEquals(1, inserts.size)
+        assertTrue(deletes.isEmpty())
+    }
+
+    @Test
+    fun reserveVisiblePendingRow_fallsBackWhenTheProviderDropsTheRow() {
+        // What a vivo/Android 16 provider does with image/tiff: the insert returns a URI and
+        // the row is gone by the time anything opens it. Images -> Downloads.
+        val inserts = mutableListOf<ExportDestinationSpec>()
+        val deleted = mutableListOf<String>()
+        val states = mutableMapOf(
+            "token-1" to StoredExportState.MISSING,
+            "token-2" to StoredExportState.PENDING,
+        )
+
+        val (token, chosen) = reserveVisiblePendingRow(
+            specs = listOf(
+                spec("image/tiff", "Pictures/Spektrafilm"),
+                spec("image/tiff", "Download/Spektrafilm"),
+            ),
+            insert = { s -> inserts += s; "token-${inserts.size}" },
+            state = { states[it] ?: StoredExportState.MISSING },
+            delete = { deleted += it; 1 },
+            sleeper = {},
+        )
+
+        assertEquals("token-2", token)
+        assertEquals("Download/Spektrafilm", chosen.relativePath)
+        assertEquals(listOf("Pictures/Spektrafilm", "Download/Spektrafilm"), inserts.map { it.relativePath })
+        assertEquals(listOf("token-1"), deleted)
+    }
+
+    @Test
+    fun reserveVisiblePendingRow_keepsTheRowWhenItsStateIsUnknown() {
+        // A provider query that throws is not evidence the row is absent: keep the first
+        // candidate, delete nothing, and let the later write/readback fail loudly if it is.
+        val deleted = mutableListOf<String>()
+        val inserts = mutableListOf<String>()
+        val (token, chosen) = reserveVisiblePendingRow(
+            specs = listOf(
+                spec("image/tiff", "Pictures/Spektrafilm"),
+                spec("image/tiff", "Download/Spektrafilm"),
+            ),
+            insert = { s -> inserts += s.relativePath; "token-${inserts.size}" },
+            state = { StoredExportState.UNKNOWN },
+            delete = { deleted += it; 1 },
+            sleeper = {},
+        )
+        assertEquals("token-1", token)
+        assertEquals("Pictures/Spektrafilm", chosen.relativePath)
+        assertEquals(1, inserts.size)
+        assertTrue(deleted.isEmpty())
+    }
+
+    @Test
+    fun reserveVisiblePendingRow_pollsUntilAPendingRowAppears() {
+        // Provider lag: MISSING on the first look, PENDING right after.
+        var look = 0
+        val (token, _) = reserveVisiblePendingRow(
+            specs = listOf(spec("image/tiff", "Pictures/Spektrafilm")),
+            insert = { "token-1" },
+            state = { if (++look < 3) StoredExportState.MISSING else StoredExportState.PENDING },
+            delete = { 1 },
+            sleeper = {},
+        )
+        assertEquals("token-1", token)
+        assertEquals(3, look)
+    }
+
+    @Test
+    fun reserveVisiblePendingRow_reportsEveryCandidateWhenNoneSticks() {
+        val failure = expectFailure {
+            reserveVisiblePendingRow(
+                specs = listOf(
+                    spec("image/tiff", "Pictures/Spektrafilm"),
+                    spec("image/tiff", "Download/Spektrafilm"),
+                ),
+                insert = { "token" },
+                state = { StoredExportState.MISSING },
+                delete = { 1 },
+                sleeper = {},
+            )
+        }
+        val message = failure.message.orEmpty()
+        assertTrue(message, message.contains("Pictures/Spektrafilm") && message.contains("Download/Spektrafilm"))
+    }
+
+    @Test
+    fun reserveVisiblePendingRow_failsWhenTheProviderReturnsNoUri() {
+        val failure = expectFailure {
+            reserveVisiblePendingRow(
+                specs = listOf(spec("image/tiff", "Pictures/Spektrafilm")),
+                insert = { null },
+                state = { StoredExportState.PENDING },
+                delete = { 1 },
+                sleeper = {},
+            )
+        }
+        assertTrue(failure is IOException)
+    }
+
+    @Test
+    fun reserveVisiblePendingRow_rejectsAnEmptyCandidateList() {
+        val failure = expectFailure {
+            reserveVisiblePendingRow(
+                specs = emptyList(),
+                insert = { "token" },
+                state = { StoredExportState.PENDING },
+                delete = { 1 },
+                sleeper = {},
+            )
+        }
+        assertTrue(failure is IllegalArgumentException)
+    }
+
     private fun artifact(
         name: String,
         bytes: ByteArray = byteArrayOf(1, 3, 3, 7, 9),

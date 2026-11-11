@@ -76,6 +76,68 @@ internal interface PendingExportBackend {
     fun pendingTokens(): Set<String> = emptySet()
 }
 
+/**
+ * Reserve a pending MediaStore row that the provider actually kept, trying each
+ * candidate [spec] in order.
+ *
+ * This exists because an insert can succeed and the row can still disappear. MediaStore's
+ * Images collection only indexes media types the platform knows; on some OEM providers
+ * (observed on a vivo/Android 16 device) `image/tiff` returns a URI that is dropped
+ * immediately, so the very next `openOutputStream` throws
+ * `FileNotFoundException: No item at content://...` -- *after* a full-resolution render,
+ * with a message that names neither the format nor the provider. That is what made a
+ * 16-bit TIFF export look like a render/memory failure while a 16-bit PNG of the same
+ * frame published fine: same code path, same size, only the MIME type differs.
+ *
+ * [specs] are tried in order; the row from a candidate that did not stick is deleted when
+ * the provider says it is MISSING. An UNKNOWN state (a query that threw) is deliberately
+ * NOT treated as a licence to delete: the next-start recovery sweep owns those rows.
+ *
+ * Returns the token and the spec whose row survived.
+ */
+internal fun reserveVisiblePendingRow(
+    specs: List<ExportDestinationSpec>,
+    insert: (ExportDestinationSpec) -> String?,
+    state: (String) -> StoredExportState,
+    delete: (String) -> Int,
+    confirmAttempts: Int = 5,
+    waitMillis: Long = 20L,
+    sleeper: (Long) -> Unit = { millis -> if (millis > 0L) Thread.sleep(millis) },
+): Pair<String, ExportDestinationSpec> {
+    require(specs.isNotEmpty()) { "at least one export destination is required" }
+    var lastToken: String? = null
+    var lastObserved = StoredExportState.UNKNOWN
+    for ((index, spec) in specs.withIndex()) {
+        val token = insert(spec)
+            ?: throw IOException("MediaStore insert failed for ${spec.mimeType} in ${spec.relativePath}")
+        lastToken = token
+        var observed = StoredExportState.UNKNOWN
+        for (attempt in 0 until confirmAttempts.coerceAtLeast(1)) {
+            observed = state(token)
+            if (observed == StoredExportState.PENDING) break
+            if (attempt < confirmAttempts - 1) sleeper(waitMillis)
+        }
+        lastObserved = observed
+        // Only a DEFINITIVE absence moves on. PENDING is the expected answer; UNKNOWN (a
+        // query that threw) and PUBLISHED are not evidence of anything, and turning them
+        // into a second insert would break devices where the first one works today.
+        if (observed != StoredExportState.MISSING) {
+            if (index > 0) Diag.i("export destination fell back to ${spec.relativePath} (${spec.mimeType})")
+            return token to spec
+        }
+        Diag.w(
+            "MediaStore dropped the pending row for ${spec.mimeType} in " +
+                "${spec.relativePath} (state=$observed)",
+        )
+        runCatching { delete(token) }
+    }
+    throw IOException(
+        "MediaStore kept none of the candidate destinations for " +
+            specs.joinToString { "${it.mimeType} in ${it.relativePath}" } +
+            " (last state=$lastObserved, token=$lastToken)",
+    )
+}
+
 internal interface PendingExportJournal {
     fun add(token: String)
     fun remove(token: String)
@@ -116,6 +178,9 @@ internal class ExportTransaction(
         verifyArtifact(artifact)
         throwIfExportCancelled(isCancelled)
         val token = backend.reserve(spec)
+        // Step markers: when publication fails, the log line names the step that failed
+        // instead of surfacing only "No item at content://..." with no context.
+        Diag.i("export destination reserved")
         var publicationReported = false
         fun reportPublication() {
             if (publicationReported) return
@@ -139,11 +204,13 @@ internal class ExportTransaction(
         try {
             throwIfExportCancelled(isCancelled)
             val copied = copyAndDigest(artifact.file, backend.openWrite(token), isCancelled)
+            Diag.i("export destination wrote ${copied.length} bytes")
             if (copied.length != artifact.length || copied.sha256 != artifact.sha256) {
                 throw IOException("destination write digest differs from staged artifact")
             }
 
             val readback = backend.openRead(token).use { digest(it, isCancelled) }
+            Diag.i("export destination readback verified ${readback.length} bytes")
             if (readback.length != artifact.length || readback.sha256 != artifact.sha256) {
                 throw IOException("destination readback digest differs from staged artifact")
             }
@@ -153,6 +220,7 @@ internal class ExportTransaction(
             // a confirmed PUBLISHED row still wins, while PENDING is deleted below.
             throwIfExportCancelled(isCancelled)
             val updated = backend.publish(token, spec)
+            Diag.i("export destination published ($updated row)")
             if (updated != 1) throw IOException("MediaStore publish updated $updated rows; expected 1")
             if (backend.state(token) != StoredExportState.PUBLISHED) {
                 throw IOException("destination did not confirm published state")
@@ -300,22 +368,54 @@ internal class AndroidPendingExportBackend(context: Context) : PendingExportBack
 
     override fun reserve(spec: ExportDestinationSpec): String {
         check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+        val (token, chosen) = reserveVisiblePendingRow(
+            specs = candidateSpecs(spec),
+            insert = ::insertPendingRow,
+            state = ::state,
+            delete = ::delete,
+        )
+        Diag.i("export destination ${chosen.relativePath} (${chosen.mimeType})")
+        return token
+    }
+
+    /**
+     * Where a pending row may be created. The Images collection is tried first so a device
+     * that indexes the type keeps putting it in Pictures; a type the platform media index
+     * does not know (TIFF) can be dropped there, so Downloads is offered as the second,
+     * type-agnostic destination. Indexed types get one candidate and behave exactly as
+     * before.
+     */
+    private fun candidateSpecs(spec: ExportDestinationSpec): List<ExportDestinationSpec> =
+        if (spec.mimeType.lowercase() in PLATFORM_INDEXED_IMAGE_MIME_TYPES) {
+            listOf(spec)
+        } else {
+            listOf(spec, spec.copy(relativePath = MEDIASTORE_DOWNLOADS_RELATIVE_PATH))
+        }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun insertPendingRow(spec: ExportDestinationSpec): String? {
+        val extension = spec.displayName.substringAfterLast('.', "tmp")
+            .filter { it.isLetterOrDigit() }
+            .take(12)
+            .ifEmpty { "tmp" }
         val values = ContentValues().apply {
-            val extension = spec.displayName.substringAfterLast('.', "tmp")
-                .filter { it.isLetterOrDigit() }
-                .take(12)
-                .ifEmpty { "tmp" }
             put(
-                MediaStore.Images.Media.DISPLAY_NAME,
+                MediaStore.MediaColumns.DISPLAY_NAME,
                 "$MEDIASTORE_PENDING_NAME_PREFIX${UUID.randomUUID()}.$extension",
             )
-            put(MediaStore.Images.Media.MIME_TYPE, spec.mimeType)
-            put(MediaStore.Images.Media.RELATIVE_PATH, spec.relativePath)
-            put(MediaStore.Images.Media.IS_PENDING, 1)
+            put(MediaStore.MediaColumns.MIME_TYPE, spec.mimeType)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, spec.relativePath)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
-        return resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)?.toString()
-            ?: throw IOException("MediaStore insert failed")
+        return resolver.insert(collectionFor(spec.relativePath), values)?.toString()
     }
+
+    private fun collectionFor(relativePath: String): Uri =
+        if (relativePath.startsWith(MEDIASTORE_DOWNLOADS_PREFIX)) {
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
 
     override fun openWrite(token: String): OutputStream =
         resolver.openOutputStream(Uri.parse(token), "w")
@@ -325,11 +425,13 @@ internal class AndroidPendingExportBackend(context: Context) : PendingExportBack
         resolver.openInputStream(Uri.parse(token))
             ?: throw IOException("could not reopen pending MediaStore output")
 
+    // MediaColumns, not Images.Media: the row may live in either collection and both use
+    // the same column names, so the update is written once.
     override fun publish(token: String, spec: ExportDestinationSpec): Int = resolver.update(
         Uri.parse(token),
         ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, spec.displayName)
-            put(MediaStore.Images.Media.IS_PENDING, 0)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, spec.displayName)
+            put(MediaStore.MediaColumns.IS_PENDING, 0)
         },
         null,
         null,
@@ -338,20 +440,31 @@ internal class AndroidPendingExportBackend(context: Context) : PendingExportBack
     override fun delete(token: String): Int = resolver.delete(Uri.parse(token), null, null)
 
     @Suppress("DEPRECATION")
-    override fun pendingTokens(): Set<String> {
-        val collection = MediaStore.setIncludePending(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+    override fun pendingTokens(): Set<String> = buildSet {
+        addAll(pendingTokens(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                             MEDIASTORE_EXPORT_RELATIVE_PATH))
+        // Rows this backend may have created in Downloads (types the Images collection
+        // does not index) have to be discoverable too, or a process death mid-write would
+        // leak a pending item forever.
+        addAll(pendingTokens(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                             MEDIASTORE_DOWNLOADS_RELATIVE_PATH))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun pendingTokens(collectionUri: Uri, relativePath: String): Set<String> {
+        val collection = MediaStore.setIncludePending(collectionUri)
         val cursor = resolver.query(
             collection,
-            arrayOf(MediaStore.Images.Media._ID),
-            "${MediaStore.Images.Media.IS_PENDING}=? AND " +
-                "${MediaStore.Images.Media.OWNER_PACKAGE_NAME}=? AND " +
-                "(${MediaStore.Images.Media.RELATIVE_PATH}=? OR ${MediaStore.Images.Media.RELATIVE_PATH}=?) AND " +
-                "${MediaStore.Images.Media.DISPLAY_NAME} LIKE ?",
+            arrayOf(MediaStore.MediaColumns._ID),
+            "${MediaStore.MediaColumns.IS_PENDING}=? AND " +
+                "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? AND " +
+                "(${MediaStore.MediaColumns.RELATIVE_PATH}=? OR ${MediaStore.MediaColumns.RELATIVE_PATH}=?) AND " +
+                "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
             arrayOf(
                 "1",
                 ownerPackageName,
-                MEDIASTORE_EXPORT_RELATIVE_PATH,
-                "$MEDIASTORE_EXPORT_RELATIVE_PATH/",
+                relativePath,
+                "$relativePath/",
                 "$MEDIASTORE_PENDING_NAME_PREFIX%",
             ),
             null,
@@ -359,12 +472,7 @@ internal class AndroidPendingExportBackend(context: Context) : PendingExportBack
         return cursor.use {
             buildSet {
                 while (it.moveToNext()) {
-                    add(
-                        ContentUris.withAppendedId(
-                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                            it.getLong(0),
-                        ).toString(),
-                    )
+                    add(ContentUris.withAppendedId(collectionUri, it.getLong(0)).toString())
                 }
             }
         }
@@ -602,5 +710,24 @@ private const val COPY_BUFFER_BYTES = 256 * 1024
 private const val EXPORT_STAGE_PREFIX = "spectrafilm-export-"
 private const val EXPORT_STAGE_SUFFIX = ".part"
 private const val MEDIASTORE_EXPORT_RELATIVE_PATH = "Pictures/Spektrafilm"
+/**
+ * Second-choice destination for a type the platform media index does not know (TIFF).
+ * Downloads accepts any file type on every provider, and a 16-bit master is a file to
+ * hand to a desktop editor, not a picture the gallery can show.
+ */
+private const val MEDIASTORE_DOWNLOADS_RELATIVE_PATH = "Download/Spektrafilm"
+private const val MEDIASTORE_DOWNLOADS_PREFIX = "Download/"
+/** Media types Android's media index knows; anything else may be discarded on insert. */
+private val PLATFORM_INDEXED_IMAGE_MIME_TYPES = setOf(
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+    "image/avif",
+    "image/bmp",
+)
 private const val MEDIASTORE_PENDING_NAME_PREFIX = "Spektrafilm-pending-tx-"
 private val mediaStoreExportProcessLock = Any()
